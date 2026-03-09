@@ -10,9 +10,6 @@ use crate::error::{FatError, Result};
 use super::io::Write;
 use super::io::{Read, Seek, SeekFrom};
 
-/// Sector size used for batched FAT reads (one read per sector instead of per entry).
-const FAT_READ_SECTOR: usize = 512;
-
 pub enum Fat {
     Fat12(Fat12),
     Fat16(Fat16),
@@ -466,7 +463,7 @@ impl Fat16 {
         Ok(Some(entry as u32))
     }
 
-    /// Read the entire cluster chain using sector-batched I/O (one read per 256 entries).
+    /// Read the entire cluster chain. Reads the whole FAT in one syscall when alloc is available.
     #[cfg(feature = "alloc")]
     pub async fn read_chain<T: Read + Seek>(
         &self,
@@ -475,27 +472,22 @@ impl Fat16 {
         max_clusters: usize,
     ) -> Result<Vec<u32>> {
         const ENTRY_SIZE: usize = size_of::<u16>();
-        let entries_per_sector = FAT_READ_SECTOR / ENTRY_SIZE; // 256
         let mut chain = Vec::new();
         let mut current = start_cluster as usize;
-        let mut sector_buf = [0u8; FAT_READ_SECTOR];
-        let mut cached_sector = None::<usize>;
         let mut iterations = 0;
+
+        // Read entire FAT in one go (one seek + one read)
+        let mut fat_buf = alloc::vec![0u8; self.size];
+        reader.seek(SeekFrom::Start(self.start as u64)).await?;
+        reader.read_exact(&mut fat_buf).await?;
 
         while current >= 2 && iterations <= max_clusters {
             chain.push(current as u32);
             iterations += 1;
 
-            let sector_index = current / entries_per_sector;
-            if cached_sector != Some(sector_index) {
-                let offset = self.start + sector_index * FAT_READ_SECTOR;
-                reader.seek(SeekFrom::Start(offset as u64)).await?;
-                reader.read_exact(&mut sector_buf).await?;
-                cached_sector = Some(sector_index);
-            }
-            let entry_in_sector = current % entries_per_sector;
+            let offset = current * ENTRY_SIZE;
             let entry_value = u16::from_le_bytes(
-                sector_buf[entry_in_sector * ENTRY_SIZE..][..ENTRY_SIZE]
+                fat_buf[offset..][..ENTRY_SIZE]
                     .try_into()
                     .unwrap(),
             );
@@ -732,7 +724,7 @@ impl Fat32 {
         Ok(Some(entry))
     }
 
-    /// Read the entire cluster chain using sector-batched I/O (one read per 128 entries).
+    /// Read the entire cluster chain. Reads the whole FAT in one syscall when alloc is available.
     #[cfg(feature = "alloc")]
     pub async fn read_chain<T: Read + Seek>(
         &self,
@@ -741,27 +733,22 @@ impl Fat32 {
         max_clusters: usize,
     ) -> Result<Vec<u32>> {
         const ENTRY_SIZE: usize = size_of::<u32>();
-        let entries_per_sector = FAT_READ_SECTOR / ENTRY_SIZE; // 128
         let mut chain = Vec::new();
         let mut current = start_cluster as usize;
-        let mut sector_buf = [0u8; FAT_READ_SECTOR];
-        let mut cached_sector = None::<usize>;
         let mut iterations = 0;
+
+        // Read entire FAT in one go (one seek + one read)
+        let mut fat_buf = alloc::vec![0u8; self.size];
+        reader.seek(SeekFrom::Start(self.start as u64)).await?;
+        reader.read_exact(&mut fat_buf).await?;
 
         while current >= 2 && iterations <= max_clusters {
             chain.push(current as u32);
             iterations += 1;
 
-            let sector_index = current / entries_per_sector;
-            if cached_sector != Some(sector_index) {
-                let offset = self.start + sector_index * FAT_READ_SECTOR;
-                reader.seek(SeekFrom::Start(offset as u64)).await?;
-                reader.read_exact(&mut sector_buf).await?;
-                cached_sector = Some(sector_index);
-            }
-            let entry_in_sector = current % entries_per_sector;
+            let offset = current * ENTRY_SIZE;
             let entry_value = u32::from_le_bytes(
-                sector_buf[entry_in_sector * ENTRY_SIZE..][..ENTRY_SIZE]
+                fat_buf[offset..][..ENTRY_SIZE]
                     .try_into()
                     .unwrap(),
             ) & Self::ENTRY_MASK;
