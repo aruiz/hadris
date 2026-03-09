@@ -2,10 +2,16 @@ io_transform! {
 
 use core::mem::size_of;
 
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
 use crate::error::{FatError, Result};
 #[cfg(feature = "write")]
 use super::io::Write;
 use super::io::{Read, Seek, SeekFrom};
+
+/// Sector size used for batched FAT reads (one read per sector instead of per entry).
+const FAT_READ_SECTOR: usize = 512;
 
 pub enum Fat {
     Fat12(Fat12),
@@ -61,6 +67,25 @@ impl Fat {
             Self::Fat12(fat12) => fat12.free_chain(rw, cluster as u16).await,
             Self::Fat16(fat16) => fat16.free_chain(rw, cluster as u16).await,
             Self::Fat32(fat32) => fat32.free_chain(rw, cluster as u32).await,
+        }
+    }
+
+    /// Read the entire cluster chain starting at `start_cluster` using batched I/O.
+    ///
+    /// Reads the FAT in sector-sized chunks (512 bytes) instead of one read per entry,
+    /// so a contiguous chain of N clusters does at most ceil(N * entry_size / 512) reads
+    /// instead of N reads.
+    #[cfg(feature = "alloc")]
+    pub async fn read_chain<T: Read + Seek>(
+        &self,
+        reader: &mut T,
+        start_cluster: u32,
+        max_clusters: usize,
+    ) -> Result<Vec<u32>> {
+        match self {
+            Self::Fat12(fat12) => fat12.read_chain(reader, start_cluster, max_clusters).await,
+            Self::Fat16(fat16) => fat16.read_chain(reader, start_cluster, max_clusters).await,
+            Self::Fat32(fat32) => fat32.read_chain(reader, start_cluster, max_clusters).await,
         }
     }
 }
@@ -186,6 +211,28 @@ impl Fat12 {
         self.validate_cluster(entry)?;
 
         Ok(Some(entry as u32))
+    }
+
+    /// Read the entire cluster chain (FAT12: one read per entry due to 12-bit packing).
+    #[cfg(feature = "alloc")]
+    pub async fn read_chain<T: Read + Seek>(
+        &self,
+        reader: &mut T,
+        start_cluster: u32,
+        max_clusters: usize,
+    ) -> Result<Vec<u32>> {
+        let mut chain = Vec::new();
+        let mut current = start_cluster as usize;
+        let mut iterations = 0;
+        while current >= 2 && iterations <= max_clusters {
+            chain.push(current as u32);
+            iterations += 1;
+            match self.next_cluster(reader, current).await? {
+                Some(next) => current = next as usize,
+                None => break,
+            }
+        }
+        Ok(chain)
     }
 
     /// Free cluster marker
@@ -419,6 +466,54 @@ impl Fat16 {
         Ok(Some(entry as u32))
     }
 
+    /// Read the entire cluster chain using sector-batched I/O (one read per 256 entries).
+    #[cfg(feature = "alloc")]
+    pub async fn read_chain<T: Read + Seek>(
+        &self,
+        reader: &mut T,
+        start_cluster: u32,
+        max_clusters: usize,
+    ) -> Result<Vec<u32>> {
+        const ENTRY_SIZE: usize = size_of::<u16>();
+        let entries_per_sector = FAT_READ_SECTOR / ENTRY_SIZE; // 256
+        let mut chain = Vec::new();
+        let mut current = start_cluster as usize;
+        let mut sector_buf = [0u8; FAT_READ_SECTOR];
+        let mut cached_sector = None::<usize>;
+        let mut iterations = 0;
+
+        while current >= 2 && iterations <= max_clusters {
+            chain.push(current as u32);
+            iterations += 1;
+
+            let sector_index = current / entries_per_sector;
+            if cached_sector != Some(sector_index) {
+                let offset = self.start + sector_index * FAT_READ_SECTOR;
+                reader.seek(SeekFrom::Start(offset as u64)).await?;
+                reader.read_exact(&mut sector_buf).await?;
+                cached_sector = Some(sector_index);
+            }
+            let entry_in_sector = current % entries_per_sector;
+            let entry_value = u16::from_le_bytes(
+                sector_buf[entry_in_sector * ENTRY_SIZE..][..ENTRY_SIZE]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            if Self::is_end_of_chain(entry_value) {
+                break;
+            }
+            if Self::is_bad_cluster(entry_value) {
+                return Err(FatError::BadCluster {
+                    cluster: current as u32,
+                });
+            }
+            self.validate_cluster(entry_value)?;
+            current = entry_value as usize;
+        }
+        Ok(chain)
+    }
+
     /// Free cluster marker
     #[cfg(feature = "write")]
     const FREE_CLUSTER: u16 = 0x0000;
@@ -635,6 +730,54 @@ impl Fat32 {
         self.validate_cluster(entry)?;
 
         Ok(Some(entry))
+    }
+
+    /// Read the entire cluster chain using sector-batched I/O (one read per 128 entries).
+    #[cfg(feature = "alloc")]
+    pub async fn read_chain<T: Read + Seek>(
+        &self,
+        reader: &mut T,
+        start_cluster: u32,
+        max_clusters: usize,
+    ) -> Result<Vec<u32>> {
+        const ENTRY_SIZE: usize = size_of::<u32>();
+        let entries_per_sector = FAT_READ_SECTOR / ENTRY_SIZE; // 128
+        let mut chain = Vec::new();
+        let mut current = start_cluster as usize;
+        let mut sector_buf = [0u8; FAT_READ_SECTOR];
+        let mut cached_sector = None::<usize>;
+        let mut iterations = 0;
+
+        while current >= 2 && iterations <= max_clusters {
+            chain.push(current as u32);
+            iterations += 1;
+
+            let sector_index = current / entries_per_sector;
+            if cached_sector != Some(sector_index) {
+                let offset = self.start + sector_index * FAT_READ_SECTOR;
+                reader.seek(SeekFrom::Start(offset as u64)).await?;
+                reader.read_exact(&mut sector_buf).await?;
+                cached_sector = Some(sector_index);
+            }
+            let entry_in_sector = current % entries_per_sector;
+            let entry_value = u32::from_le_bytes(
+                sector_buf[entry_in_sector * ENTRY_SIZE..][..ENTRY_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) & Self::ENTRY_MASK;
+
+            if Self::is_end_of_chain(entry_value) {
+                break;
+            }
+            if Self::is_bad_cluster(entry_value) {
+                return Err(FatError::BadCluster {
+                    cluster: current as u32,
+                });
+            }
+            self.validate_cluster(entry_value)?;
+            current = entry_value as usize;
+        }
+        Ok(chain)
     }
 
     /// Write a cluster entry to the FAT table at the specified FAT copy
